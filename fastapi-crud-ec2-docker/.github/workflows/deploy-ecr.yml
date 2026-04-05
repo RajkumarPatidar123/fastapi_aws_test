@@ -1,0 +1,84 @@
+name: Build image to ECR and deploy on EC2
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: production-ecr-deploy
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+      EC2_USER: ${{ secrets.EC2_USER }}
+      APP_DIR: /home/ubuntu/fastapi-crud-ec2
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials from GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE_URI="$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          IMAGE_LATEST="$REGISTRY/$ECR_REPOSITORY:latest"
+
+          docker build -t "$IMAGE_URI" .
+          docker tag "$IMAGE_URI" "$IMAGE_LATEST"
+          docker push "$IMAGE_URI"
+          docker push "$IMAGE_LATEST"
+
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+
+      - name: Configure SSH
+        env:
+          EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$EC2_SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload production compose files
+        run: |
+          scp -i ~/.ssh/id_ed25519 docker-compose.prod.yml .env.prod.example "$EC2_USER@$EC2_HOST:/tmp/"
+
+      - name: Pull new image and restart on EC2
+        run: |
+          ssh -i ~/.ssh/id_ed25519 "$EC2_USER@$EC2_HOST" "APP_DIR='${APP_DIR}' IMAGE_URI='${IMAGE_URI}' AWS_REGION='${AWS_REGION}' ECR_REPOSITORY='${ECR_REPOSITORY}' bash -s" <<'EOF_REMOTE'
+            set -euo pipefail
+
+            mkdir -p "$APP_DIR/data"
+            mv /tmp/docker-compose.prod.yml "$APP_DIR/docker-compose.prod.yml"
+            mv /tmp/.env.prod.example "$APP_DIR/.env.prod"
+            sed -i "s|^IMAGE_URI=.*|IMAGE_URI=$IMAGE_URI|" "$APP_DIR/.env.prod"
+
+            cd "$APP_DIR"
+            aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$(echo "$IMAGE_URI" | cut -d/ -f1)"
+            docker compose --env-file .env.prod -f docker-compose.prod.yml pull
+            docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --remove-orphans
+            docker image prune -f
+          EOF_REMOTE

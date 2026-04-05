@@ -1,0 +1,9 @@
+services:
+  api:
+    image: ${IMAGE_URI:?IMAGE_URI is required}
+    container_name: fastapi-crud
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
